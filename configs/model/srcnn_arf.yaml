@@ -1,0 +1,18 @@
+in_channels: 1
+out_channels: 1
+num_features_1: 64
+num_features_2: 32
+
+# Adaptive Receptive Field (Section 2: 最基础的显式公式) hyperparameters.
+# s_i = alpha * d_i + beta * c_i + gamma * d_i * c_i
+# t_i = t_min + (t_max - t_min) * sigmoid(s_i)
+# k_i = nearest_odd(t_i), clamped to [t_min, t_max]
+alpha: 2.0
+beta: 1.0
+gamma: 1.0
+t_min: 3.0
+t_max: 11.0
+
+# Optional manual override of the three kernel sizes (must be 3 odd ints).
+# Leave commented out to let the formula decide.
+# kernel_sizes: [9, 5, 5]

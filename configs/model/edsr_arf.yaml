@@ -1,0 +1,21 @@
+in_channels: 1
+out_channels: 1
+n_resblocks: 16
+n_feats: 64
+res_scale: 0.1
+
+# Adaptive Receptive Field (Section 2) hyperparameters.
+# s_i = alpha * d_i + beta * c_i + gamma * d_i * c_i
+# t_i = t_min + (t_max - t_min) * sigmoid(s_i)
+# k_i = nearest_odd(t_i), clamped to [t_min, t_max]
+alpha: 2.0
+beta: 1.0
+gamma: 1.0
+t_min: 3.0
+t_max: 11.0
+
+# Optional manual override for all convolution kernels in EDSR_ARF.
+# Expected length:
+#   total_convs = 1 + 2*n_resblocks + 1 + (1 if scale==2 else 2) + 1
+# Example for n_resblocks=16, scale=4 => total_convs=37
+# kernel_sizes: [3, 3, 3, ...]

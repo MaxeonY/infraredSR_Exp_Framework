@@ -1,0 +1,5 @@
+in_channels: 1
+out_channels: 1
+feat_channels: 48
+num_dyna: 6
+dam_reduction: 16

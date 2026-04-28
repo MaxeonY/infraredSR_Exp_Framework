@@ -1,0 +1,5 @@
+batch_size: 8
+epochs: 30
+lr: 0.0002
+weight_decay: 0.0
+val_interval: 1

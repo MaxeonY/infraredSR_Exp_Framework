@@ -1,0 +1,9 @@
+degradation:
+  downsample_mode: bicubic
+  noise_type: gaussian
+  noise_prob: 0.5
+  noise_sigma_range: [1.0, 10.0]
+  compression_prob: 0.5
+  jpeg_quality_range: [30, 95]
+  deterministic_eval: true
+  eval_seed: 3407
