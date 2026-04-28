@@ -1,6 +1,7 @@
-﻿import argparse
+import argparse
 import csv
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,23 @@ MODEL_COLORS = {
     "rcan": "#f58231",
     "ldynsr": "#2b8a3e",
 }
+
+
+EXTENDED_METRIC_KEYS = ['mse', 'rmse', 'gradient_mae', 'laplacian_mae', 'fft_l1', 'hfen']
+PROFILE_KEYS = [
+    'params',
+    'params_m',
+    'model_size_mb',
+    'macs',
+    'gmacs',
+    'flops',
+    'gflops',
+    'latency_avg_ms',
+    'latency_median_ms',
+    'latency_p95_ms',
+    'fps',
+    'peak_gpu_mem_mb',
+]
 
 
 def _color_for(model_name: str) -> str:
@@ -66,6 +84,26 @@ def _resolve_metrics_csv(report: Dict[str, str], report_path: Path) -> Optional[
     return None
 
 
+def _resolve_extended_summary_json(report_path: Path) -> Optional[Path]:
+    candidates = list(report_path.parent.glob("*_extended_summary.json"))
+    if not candidates:
+        return None
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0].resolve()
+
+
+def _parse_optional_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "" or text.lower() in {"none", "n/a", "na", "nan", "null"}:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
 def _load_sample_metrics(csv_path: Optional[Path]) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     if csv_path is None or (not csv_path.exists()):
@@ -78,10 +116,16 @@ def _load_sample_metrics(csv_path: Optional[Path]) -> List[Dict[str, object]]:
                     {
                         "index": int(row.get("index", 0)),
                         "dataset_index": int(row.get("dataset_index", row.get("index", 0))),
-                        "path": row.get("path", ""),
+                        "path": row.get("path", row.get("filename", "")),
                         "l1": float(row.get("l1", 0.0)),
                         "psnr": float(row.get("psnr", 0.0)),
                         "ssim": float(row.get("ssim", 0.0)),
+                        "mse": _parse_optional_float(row.get("mse")),
+                        "rmse": _parse_optional_float(row.get("rmse")),
+                        "gradient_mae": _parse_optional_float(row.get("gradient_mae")),
+                        "laplacian_mae": _parse_optional_float(row.get("laplacian_mae")),
+                        "fft_l1": _parse_optional_float(row.get("fft_l1")),
+                        "hfen": _parse_optional_float(row.get("hfen")),
                     }
                 )
             except Exception:
@@ -319,6 +363,42 @@ def load_result_from_report(report_path: Path, logger=None) -> Optional[Dict[str
     num_samples = int(report.get("num_samples", len(sample_metrics))) if report.get("num_samples") else len(sample_metrics)
     scope_key, scope_label = _infer_scope(report)
 
+    quality_means = {
+        "mse": _parse_optional_float(report.get("avg_mse")),
+        "rmse": _parse_optional_float(report.get("avg_rmse")),
+        "gradient_mae": _parse_optional_float(report.get("avg_gradient_mae")),
+        "laplacian_mae": _parse_optional_float(report.get("avg_laplacian_mae")),
+        "fft_l1": _parse_optional_float(report.get("avg_fft_l1")),
+        "hfen": _parse_optional_float(report.get("avg_hfen")),
+    }
+    profile = {k: _parse_optional_float(report.get(k)) for k in PROFILE_KEYS}
+
+    summary_json = _resolve_extended_summary_json(report_path)
+    if summary_json is not None:
+        try:
+            payload = json.loads(summary_json.read_text(encoding="utf-8"))
+            quality_payload = payload.get("quality_metrics", {})
+            profile_payload = payload.get("profile", {})
+            quality_means["mse"] = quality_means["mse"] if quality_means["mse"] is not None else _parse_optional_float(quality_payload.get("mse_mean"))
+            quality_means["rmse"] = quality_means["rmse"] if quality_means["rmse"] is not None else _parse_optional_float(quality_payload.get("rmse_mean"))
+            quality_means["gradient_mae"] = (
+                quality_means["gradient_mae"]
+                if quality_means["gradient_mae"] is not None
+                else _parse_optional_float(quality_payload.get("gradient_mae_mean"))
+            )
+            quality_means["laplacian_mae"] = (
+                quality_means["laplacian_mae"]
+                if quality_means["laplacian_mae"] is not None
+                else _parse_optional_float(quality_payload.get("laplacian_mae_mean"))
+            )
+            quality_means["fft_l1"] = quality_means["fft_l1"] if quality_means["fft_l1"] is not None else _parse_optional_float(quality_payload.get("fft_l1_mean"))
+            quality_means["hfen"] = quality_means["hfen"] if quality_means["hfen"] is not None else _parse_optional_float(quality_payload.get("hfen_mean"))
+            for key in PROFILE_KEYS:
+                if profile[key] is None:
+                    profile[key] = _parse_optional_float(profile_payload.get(key))
+        except Exception:
+            pass
+
     return {
         "label": f"{model}_x{scale}",
         "model_name": model,
@@ -332,6 +412,22 @@ def load_result_from_report(report_path: Path, logger=None) -> Optional[Dict[str
         "scope_label": scope_label,
         "report_path": report_path.resolve(),
         "run_root": report_path.resolve().parent,
+        "mse": quality_means["mse"],
+        "rmse": quality_means["rmse"],
+        "gradient_mae": quality_means["gradient_mae"],
+        "laplacian_mae": quality_means["laplacian_mae"],
+        "fft_l1": quality_means["fft_l1"],
+        "hfen": quality_means["hfen"],
+        "profile": profile,
+        "params_m": profile.get("params_m"),
+        "model_size_mb": profile.get("model_size_mb"),
+        "gmacs": profile.get("gmacs"),
+        "gflops": profile.get("gflops"),
+        "latency_avg_ms": profile.get("latency_avg_ms"),
+        "latency_median_ms": profile.get("latency_median_ms"),
+        "latency_p95_ms": profile.get("latency_p95_ms"),
+        "fps": profile.get("fps"),
+        "peak_gpu_mem_mb": profile.get("peak_gpu_mem_mb"),
     }
 
 
@@ -582,6 +678,90 @@ def save_cross_scale_comparison(
     logger.info(f"  [cross-scale] Saved chart: {fig_path}")
 
 
+def _save_scatter_plot(
+    rows: List[Dict[str, Any]],
+    x_key: str,
+    y_key: str,
+    path: Path,
+    xlabel: str,
+    ylabel: str,
+    logger,
+) -> None:
+    valid = [r for r in rows if r.get(x_key) is not None and r.get(y_key) is not None]
+    if len(valid) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for r in valid:
+        ax.scatter(float(r[x_key]), float(r[y_key]), color=_color_for(r["model_name"]), s=70, alpha=0.9)
+        ax.text(float(r[x_key]), float(r[y_key]), r["model_name"].upper(), fontsize=8)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved extended chart: {path}")
+
+
+def _save_bar_metric_plot(
+    rows: List[Dict[str, Any]],
+    metric_key: str,
+    title: str,
+    ylabel: str,
+    path: Path,
+    logger,
+) -> None:
+    valid = [r for r in rows if r.get(metric_key) is not None]
+    if len(valid) == 0:
+        return
+
+    valid = sorted(valid, key=lambda r: float(r[metric_key]))
+    labels = [f"{r['model_name'].upper()}_x{r['scale']}" for r in valid]
+    values = np.array([float(r[metric_key]) for r in valid], dtype=np.float32)
+    colors = [_color_for(r["model_name"]) for r in valid]
+    x = np.arange(len(valid))
+
+    fig, ax = plt.subplots(figsize=(max(10, len(valid) * 1.2), 5.8))
+    ax.bar(x, values, color=colors, alpha=0.9)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved extended chart: {path}")
+
+
+def _save_quality_efficiency_pareto(rows: List[Dict[str, Any]], path: Path, logger) -> None:
+    x_key = "latency_avg_ms" if any(r.get("latency_avg_ms") is not None for r in rows) else "gmacs"
+    x_label = "Latency Avg (ms)" if x_key == "latency_avg_ms" else "GMACs"
+    valid = [r for r in rows if r.get(x_key) is not None and r.get("avg_psnr") is not None]
+    if len(valid) == 0:
+        return
+
+    bubble_raw = np.array([float(r["params_m"]) if r.get("params_m") is not None else 1.0 for r in valid], dtype=np.float32)
+    bubble = np.clip(bubble_raw * 40.0, 40.0, 800.0)
+
+    fig, ax = plt.subplots(figsize=(8.5, 6.5))
+    for i, r in enumerate(valid):
+        x = float(r[x_key])
+        y = float(r["avg_psnr"])
+        ax.scatter(x, y, s=float(bubble[i]), color=_color_for(r["model_name"]), alpha=0.45, edgecolors="black", linewidths=0.6)
+        ax.text(x, y, r["model_name"].upper(), fontsize=8)
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("PSNR")
+    ax.set_title("Quality-Efficiency Pareto")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved extended chart: {path}")
+
+
 def save_all_models_summary(results: List[Dict[str, Any]], out_dir: Path, logger) -> None:
     if not results:
         return
@@ -596,6 +776,64 @@ def save_all_models_summary(results: List[Dict[str, Any]], out_dir: Path, logger
         for r in rows:
             writer.writerow([r["model_name"], r["scale"], f"{r['avg_psnr']:.4f}", f"{r['avg_ssim']:.6f}", f"{r['avg_loss']:.6f}", r["num_samples"]])
     logger.info(f"  Saved summary CSV: {csv_path}")
+
+    ext_csv_path = out_dir / "all_models_extended_summary.csv"
+    with ext_csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "model",
+                "scale",
+                "num_samples",
+                "avg_psnr",
+                "avg_ssim",
+                "avg_l1",
+                "mse",
+                "rmse",
+                "gradient_mae",
+                "laplacian_mae",
+                "fft_l1",
+                "hfen",
+                "params_m",
+                "model_size_mb",
+                "gmacs",
+                "gflops",
+                "latency_avg_ms",
+                "latency_median_ms",
+                "latency_p95_ms",
+                "fps",
+                "peak_gpu_mem_mb",
+                "report_path",
+            ]
+        )
+        for r in rows:
+            writer.writerow(
+                [
+                    r["model_name"],
+                    r["scale"],
+                    r["num_samples"],
+                    r["avg_psnr"],
+                    r["avg_ssim"],
+                    r["avg_loss"],
+                    r.get("mse"),
+                    r.get("rmse"),
+                    r.get("gradient_mae"),
+                    r.get("laplacian_mae"),
+                    r.get("fft_l1"),
+                    r.get("hfen"),
+                    r.get("params_m"),
+                    r.get("model_size_mb"),
+                    r.get("gmacs"),
+                    r.get("gflops"),
+                    r.get("latency_avg_ms"),
+                    r.get("latency_median_ms"),
+                    r.get("latency_p95_ms"),
+                    r.get("fps"),
+                    r.get("peak_gpu_mem_mb"),
+                    str(r["report_path"]),
+                ]
+            )
+    logger.info(f"  Saved extended summary CSV: {ext_csv_path}")
 
     labels = [f"{r['model_name'].upper()}_x{r['scale']}" for r in rows]
     psnr = np.array([r["avg_psnr"] for r in rows], dtype=np.float32)
@@ -622,6 +860,16 @@ def save_all_models_summary(results: List[Dict[str, Any]], out_dir: Path, logger
     fig.savefig(fig_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved summary chart: {fig_path}")
+
+    _save_scatter_plot(rows, "params_m", "avg_psnr", out_dir / "psnr_vs_params.png", "Params (M)", "PSNR", logger)
+    _save_scatter_plot(rows, "gmacs", "avg_psnr", out_dir / "psnr_vs_gmacs.png", "GMACs", "PSNR", logger)
+    _save_scatter_plot(rows, "latency_avg_ms", "avg_psnr", out_dir / "psnr_vs_latency.png", "Latency Avg (ms)", "PSNR", logger)
+    _save_scatter_plot(rows, "latency_avg_ms", "avg_ssim", out_dir / "ssim_vs_latency.png", "Latency Avg (ms)", "SSIM", logger)
+    _save_quality_efficiency_pareto(rows, out_dir / "quality_efficiency_pareto.png", logger)
+    _save_bar_metric_plot(rows, "gradient_mae", "Gradient MAE Comparison", "Gradient MAE", out_dir / "gradient_mae_comparison.png", logger)
+    _save_bar_metric_plot(rows, "laplacian_mae", "Laplacian MAE Comparison", "Laplacian MAE", out_dir / "laplacian_mae_comparison.png", logger)
+    _save_bar_metric_plot(rows, "fft_l1", "FFT L1 Comparison", "FFT L1", out_dir / "fft_l1_comparison.png", logger)
+    _save_bar_metric_plot(rows, "hfen", "HFEN Comparison", "HFEN", out_dir / "hfen_comparison.png", logger)
 
 
 def collect_reference_reports(

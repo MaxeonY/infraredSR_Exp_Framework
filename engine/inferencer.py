@@ -11,11 +11,12 @@ import torch.nn.functional as F
 from datasets.degrade import normalize_to_float32, read_grayscale_image
 from models import SUPPORTED_MODELS, build_model, merge_model_kwargs
 from utils.checkpoint import load_checkpoint, read_checkpoint
-from utils.metrics import calculate_psnr, calculate_ssim
+from utils.metrics import calculate_extended_metrics, calculate_psnr, calculate_ssim
 from utils.visualize import save_comparison_figure, save_difference_map
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+EXTENDED_METRIC_KEYS = ["mse", "rmse", "gradient_mae", "laplacian_mae", "fft_l1", "hfen"]
 
 
 def resolve_device(device_str: str) -> torch.device:
@@ -154,17 +155,21 @@ def save_metrics_csv(rows: List[Dict[str, object]], csv_path: Path) -> None:
     if len(rows) == 0:
         return
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    extended_enabled = any(any(k in row and row[k] != "" for k in EXTENDED_METRIC_KEYS) for row in rows)
     fieldnames = [
+        "filename",
         "input_path",
         "sr_path",
         "gt_path",
         "l1",
         "psnr",
         "ssim",
-        "sr_shape",
-        "gt_shape",
-        "shape_aligned",
     ]
+    if extended_enabled:
+        fieldnames.extend(EXTENDED_METRIC_KEYS)
+    fieldnames.extend(["sr_shape", "gt_shape", "shape_aligned"])
+
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -211,6 +216,7 @@ def run_inference(args, logger) -> None:
     logger.info(f"Input       : {input_path.resolve()}")
     logger.info(f"Num images  : {len(input_images)}")
     logger.info(f"Output dir  : {output_dir}")
+    logger.info(f"Extended metrics: {'on' if args.extended_metrics else 'off'}")
     if "epoch" in checkpoint:
         logger.info(f"Ckpt epoch  : {checkpoint['epoch']}")
     if "best_metric" in checkpoint:
@@ -222,6 +228,7 @@ def run_inference(args, logger) -> None:
     metric_psnr_sum = 0.0
     metric_ssim_sum = 0.0
     metric_l1_sum = 0.0
+    ext_sums: Dict[str, float] = {k: 0.0 for k in EXTENDED_METRIC_KEYS}
 
     with torch.no_grad():
         for idx, image_path in enumerate(input_images, start=1):
@@ -240,6 +247,7 @@ def run_inference(args, logger) -> None:
                 save_grayscale_float_image(bicubic_np, bicubic_path)
 
             row: Dict[str, object] = {
+                "filename": image_path.name,
                 "input_path": str(image_path.resolve()),
                 "sr_path": str(sr_path.resolve()),
                 "gt_path": "",
@@ -250,6 +258,8 @@ def run_inference(args, logger) -> None:
                 "gt_shape": "",
                 "shape_aligned": "",
             }
+            for key in EXTENDED_METRIC_KEYS:
+                row[key] = ""
 
             if gt_ref is not None:
                 gt_path = resolve_gt_path(image_path=image_path, gt_ref=gt_ref, input_root=input_root)
@@ -278,6 +288,12 @@ def run_inference(args, logger) -> None:
                             "shape_aligned": "yes" if mismatch else "no_need",
                         }
                     )
+
+                    if args.extended_metrics:
+                        ext_vals = calculate_extended_metrics(sr_tensor, gt_tensor)
+                        for key in EXTENDED_METRIC_KEYS:
+                            ext_sums[key] += float(ext_vals[key])
+                            row[key] = f"{float(ext_vals[key]):.6f}"
 
                     if args.save_visuals:
                         vis_root = output_dir / "visuals"
@@ -324,6 +340,20 @@ def run_inference(args, logger) -> None:
             f"PSNR={metric_psnr_sum / metric_count:.4f} | "
             f"SSIM={metric_ssim_sum / metric_count:.6f}"
         )
+        if args.extended_metrics:
+            logger.info(
+                "Extended means | "
+                + " | ".join(
+                    [
+                        f"MSE={ext_sums['mse'] / metric_count:.6f}",
+                        f"RMSE={ext_sums['rmse'] / metric_count:.6f}",
+                        f"GradMAE={ext_sums['gradient_mae'] / metric_count:.6f}",
+                        f"LapMAE={ext_sums['laplacian_mae'] / metric_count:.6f}",
+                        f"FFT_L1={ext_sums['fft_l1'] / metric_count:.6f}",
+                        f"HFEN={ext_sums['hfen'] / metric_count:.6f}",
+                    ]
+                )
+            )
     else:
         logger.info("No GT metrics computed. Provide --gt for quantitative evaluation.")
     logger.info("Inference finished.")

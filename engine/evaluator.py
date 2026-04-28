@@ -1,4 +1,5 @@
 import csv
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,8 +12,32 @@ from torch.utils.data import DataLoader, Subset
 from datasets.m3fd_dataset import M3FDSRDataset
 from models import SUPPORTED_MODELS, build_model, get_model_default_kwargs, merge_model_kwargs
 from utils.checkpoint import load_checkpoint, read_checkpoint
-from utils.metrics import calculate_psnr, calculate_ssim
+from utils.metrics import calculate_extended_metrics, calculate_psnr, calculate_ssim
+from utils.profiling import (
+    benchmark_inference_time,
+    count_parameters,
+    estimate_model_size_mb,
+    measure_peak_gpu_memory,
+    profile_macs_and_flops,
+)
 from utils.visualize import save_comparison_figure, save_difference_map
+
+
+EXTENDED_METRIC_KEYS = ["mse", "rmse", "gradient_mae", "laplacian_mae", "fft_l1", "hfen"]
+PROFILE_KEYS = [
+    "params",
+    "params_m",
+    "model_size_mb",
+    "macs",
+    "gmacs",
+    "flops",
+    "gflops",
+    "latency_avg_ms",
+    "latency_median_ms",
+    "latency_p95_ms",
+    "fps",
+    "peak_gpu_mem_mb",
+]
 
 
 def infer_model_scale_from_checkpoint(ckpt_path: Path) -> Tuple[Optional[str], Optional[int]]:
@@ -45,6 +70,19 @@ def _canonicalize_path(path_like: str) -> str:
     except Exception:
         pass
     return _normalize_path_for_match(str(p))
+
+
+def _na(value: Optional[float], precision: int = 6) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.{precision}f}"
+    except Exception:
+        return str(value)
+
+
+def _build_empty_profile() -> Dict[str, Optional[float]]:
+    return {k: None for k in PROFILE_KEYS}
 
 
 def resolve_sample_indices(
@@ -115,24 +153,60 @@ def resolve_sample_indices(
     return indices
 
 
-def save_per_sample_metrics(sample_metrics: List[Dict[str, object]], metrics_dir: Path) -> Path:
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = metrics_dir / "per_sample_metrics.csv"
-    fieldnames = ["index", "dataset_index", "path", "l1", "psnr", "ssim"]
+def save_per_sample_metrics(
+    sample_metrics: List[Dict[str, object]],
+    run_root: Path,
+    run_label: str,
+    extended_metrics: bool,
+) -> Path:
+    run_root.mkdir(parents=True, exist_ok=True)
+    csv_path = run_root / f"{run_label}_metrics_per_sample.csv"
+
+    fieldnames = ["filename", "psnr", "ssim", "l1"]
+    if extended_metrics:
+        fieldnames.extend(EXTENDED_METRIC_KEYS)
+    fieldnames.extend(["index", "dataset_index", "path"])
+
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for item in sample_metrics:
-            writer.writerow(
-                {
-                    "index": item["index"],
-                    "dataset_index": item.get("dataset_index", item["index"]),
-                    "path": item["path"],
-                    "l1": f"{float(item['l1']):.6f}",
+            row = {
+                "filename": item.get("filename", ""),
+                "psnr": f"{float(item['psnr']):.6f}",
+                "ssim": f"{float(item['ssim']):.6f}",
+                "l1": f"{float(item['l1']):.6f}",
+                "index": item["index"],
+                "dataset_index": item.get("dataset_index", item["index"]),
+                "path": item.get("path", ""),
+            }
+            if extended_metrics:
+                for key in EXTENDED_METRIC_KEYS:
+                    row[key] = f"{float(item.get(key, 0.0)):.6f}"
+            writer.writerow(row)
+
+    legacy_metrics_dir = run_root / "metrics"
+    legacy_metrics_dir.mkdir(parents=True, exist_ok=True)
+    legacy_csv = legacy_metrics_dir / "per_sample_metrics.csv"
+    if legacy_csv != csv_path:
+        with legacy_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in sample_metrics:
+                row = {
+                    "filename": item.get("filename", ""),
                     "psnr": f"{float(item['psnr']):.6f}",
                     "ssim": f"{float(item['ssim']):.6f}",
+                    "l1": f"{float(item['l1']):.6f}",
+                    "index": item["index"],
+                    "dataset_index": item.get("dataset_index", item["index"]),
+                    "path": item.get("path", ""),
                 }
-            )
+                if extended_metrics:
+                    for key in EXTENDED_METRIC_KEYS:
+                        row[key] = f"{float(item.get(key, 0.0)):.6f}"
+                writer.writerow(row)
+
     return csv_path
 
 
@@ -147,6 +221,73 @@ def _build_model_from_checkpoint(model_name: str, scale: int, checkpoint_path: P
     model = build_model(model_name=model_name, scale=scale, **model_kwargs).to(device)
     checkpoint = load_checkpoint(str(checkpoint_path), model=model, optimizer=None, map_location=device.type)
     return model, checkpoint
+
+
+def _prepare_profile_input_shape(
+    model_name: str,
+    scale: int,
+    profile_input_size: Tuple[int, int, int, int],
+    device: torch.device,
+) -> Tuple[int, int, int, int]:
+    dummy_lr = torch.zeros(profile_input_size, device=device, dtype=torch.float32)
+    model_input = prepare_model_input(model_name, dummy_lr, scale)
+    return tuple(int(v) for v in model_input.shape)
+
+
+def _compute_profile(
+    model: nn.Module,
+    model_name: str,
+    scale: int,
+    args,
+    device: torch.device,
+    logger,
+) -> Dict[str, Optional[float]]:
+    profile_data = _build_empty_profile()
+    if not args.profile_model and not args.benchmark_runtime:
+        return profile_data
+
+    input_shape = _prepare_profile_input_shape(
+        model_name=model_name,
+        scale=scale,
+        profile_input_size=tuple(args.profile_input_size),
+        device=device,
+    )
+
+    params = count_parameters(model)
+    profile_data["params"] = int(params)
+    profile_data["params_m"] = float(params / 1e6)
+    profile_data["model_size_mb"] = estimate_model_size_mb(model)
+
+    if args.profile_model:
+        try:
+            profile_data.update(profile_macs_and_flops(model=model, input_shape=input_shape, device=device))
+        except Exception as exc:
+            logger.warning(f"Failed to profile MACs/FLOPs for {model_name} x{scale}: {exc}")
+
+    if args.benchmark_runtime:
+        try:
+            profile_data.update(
+                benchmark_inference_time(
+                    model=model,
+                    input_shape=input_shape,
+                    device=device,
+                    warmup=args.benchmark_warmup,
+                    repeat=args.benchmark_repeat,
+                )
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to benchmark runtime for {model_name} x{scale}: {exc}")
+
+        try:
+            profile_data["peak_gpu_mem_mb"] = measure_peak_gpu_memory(
+                model=model,
+                input_shape=input_shape,
+                device=device,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to measure peak GPU memory for {model_name} x{scale}: {exc}")
+
+    return profile_data
 
 
 def evaluate_single_model(
@@ -213,17 +354,13 @@ def evaluate_single_model(
     total_samples = 0
     sample_metrics: List[Dict[str, object]] = []
 
+    ext_sums: Dict[str, float] = {k: 0.0 for k in EXTENDED_METRIC_KEYS}
+
     save_results_dir = Path(args.save_results_dir)
     run_label = f"{model_name}_x{scale}"
-    if len(selected_indices) != len(dataset):
-        if len(selected_indices) == 1:
-            run_label = f"{run_label}_sample{selected_indices[0]:05d}"
-        else:
-            run_label = f"{run_label}_subset{len(selected_indices)}"
     run_root = save_results_dir / run_label
     vis_seq_dir = run_root / "figures" / "sequential"
     vis_rank_dir = run_root / "figures" / "ranked"
-    metrics_dir = run_root / "metrics"
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -240,16 +377,24 @@ def evaluate_single_model(
                 l1 = torch.mean(torch.abs(sr[i] - hr[i])).item()
                 sample_path = str(paths[i])
                 dataset_index = path_to_dataset_index.get(_canonicalize_path(sample_path), -1)
-                sample_metrics.append(
-                    {
-                        "index": total_samples,
-                        "dataset_index": dataset_index,
-                        "path": sample_path,
-                        "l1": l1,
-                        "psnr": psnr,
-                        "ssim": ssim,
-                    }
-                )
+                item: Dict[str, object] = {
+                    "index": total_samples,
+                    "dataset_index": dataset_index,
+                    "path": sample_path,
+                    "filename": Path(sample_path).name,
+                    "l1": l1,
+                    "psnr": psnr,
+                    "ssim": ssim,
+                }
+
+                if args.extended_metrics:
+                    ext_vals = calculate_extended_metrics(sr[i], hr[i])
+                    for key in EXTENDED_METRIC_KEYS:
+                        val = float(ext_vals[key])
+                        item[key] = val
+                        ext_sums[key] += val
+
+                sample_metrics.append(item)
                 total_psnr += psnr
                 total_ssim += ssim
                 total_samples += 1
@@ -275,10 +420,34 @@ def evaluate_single_model(
     avg_loss = total_loss / max(total_samples, 1)
     avg_psnr = total_psnr / max(total_samples, 1)
     avg_ssim = total_ssim / max(total_samples, 1)
+    ext_means: Dict[str, Optional[float]] = {k: None for k in EXTENDED_METRIC_KEYS}
+    if args.extended_metrics and total_samples > 0:
+        for k in EXTENDED_METRIC_KEYS:
+            ext_means[k] = ext_sums[k] / total_samples
+
     logger.info(f"  Result - L1: {avg_loss:.6f} | PSNR: {avg_psnr:.4f} | SSIM: {avg_ssim:.6f}")
+    if args.extended_metrics:
+        logger.info(
+            "  Extended - "
+            + " | ".join(
+                [
+                    f"MSE: {_na(ext_means['mse'])}",
+                    f"RMSE: {_na(ext_means['rmse'])}",
+                    f"GradMAE: {_na(ext_means['gradient_mae'])}",
+                    f"LapMAE: {_na(ext_means['laplacian_mae'])}",
+                    f"FFT_L1: {_na(ext_means['fft_l1'])}",
+                    f"HFEN: {_na(ext_means['hfen'])}",
+                ]
+            )
+        )
 
     run_root.mkdir(parents=True, exist_ok=True)
-    metrics_csv_path = save_per_sample_metrics(sample_metrics, metrics_dir)
+    metrics_csv_path = save_per_sample_metrics(
+        sample_metrics=sample_metrics,
+        run_root=run_root,
+        run_label=run_label,
+        extended_metrics=args.extended_metrics,
+    )
     logger.info(f"  Saved per-sample metrics: {metrics_csv_path}")
 
     if save_visuals and not args.no_rank_visuals:
@@ -318,11 +487,19 @@ def evaluate_single_model(
                         save_path=str(group_dir / f"{prefix}_diff.png"),
                     )
 
-                    # Keep peak GPU memory flat when ranking visuals are enabled.
                     del lr_batch, hr_batch, sr_batch
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
         logger.info(f"  Saved ranked visualizations: {vis_rank_dir}")
+
+    profile_data = _compute_profile(
+        model=model,
+        model_name=model_name,
+        scale=scale,
+        args=args,
+        device=device,
+        logger=logger,
+    )
 
     best_sample = max(sample_metrics, key=lambda x: float(x["psnr"])) if sample_metrics else None
     worst_sample = min(sample_metrics, key=lambda x: float(x["psnr"])) if sample_metrics else None
@@ -340,14 +517,34 @@ def evaluate_single_model(
         f"num_total_samples={len(dataset)}",
         f"selected_indices={selected_indices_text}",
         f"avg_l1_loss={avg_loss:.6f}",
-        f"avg_psnr={avg_psnr:.4f}",
+        f"avg_psnr={avg_psnr:.6f}",
         f"avg_ssim={avg_ssim:.6f}",
+        f"avg_mse={_na(ext_means['mse']) if args.extended_metrics else 'N/A'}",
+        f"avg_rmse={_na(ext_means['rmse']) if args.extended_metrics else 'N/A'}",
+        f"avg_gradient_mae={_na(ext_means['gradient_mae']) if args.extended_metrics else 'N/A'}",
+        f"avg_laplacian_mae={_na(ext_means['laplacian_mae']) if args.extended_metrics else 'N/A'}",
+        f"avg_fft_l1={_na(ext_means['fft_l1']) if args.extended_metrics else 'N/A'}",
+        f"avg_hfen={_na(ext_means['hfen']) if args.extended_metrics else 'N/A'}",
         f"device={device}",
         f"metrics_csv={metrics_csv_path}",
         "metric_charts=disabled",
         f"sequential_visuals_dir={vis_seq_dir if save_visuals else 'disabled'}",
         f"ranked_visuals_dir={vis_rank_dir if (save_visuals and not args.no_rank_visuals) else 'disabled'}",
+        f"params={_na(profile_data.get('params'), 0)}",
+        f"params_m={_na(profile_data.get('params_m'))}",
+        f"model_size_mb={_na(profile_data.get('model_size_mb'))}",
+        f"macs={_na(profile_data.get('macs'))}",
+        f"gmacs={_na(profile_data.get('gmacs'))}",
+        f"flops={_na(profile_data.get('flops'))}",
+        f"gflops={_na(profile_data.get('gflops'))}",
+        f"latency_avg_ms={_na(profile_data.get('latency_avg_ms'))}",
+        f"latency_median_ms={_na(profile_data.get('latency_median_ms'))}",
+        f"latency_p95_ms={_na(profile_data.get('latency_p95_ms'))}",
+        f"fps={_na(profile_data.get('fps'))}",
+        f"peak_gpu_mem_mb={_na(profile_data.get('peak_gpu_mem_mb'))}",
     ]
+    if device.type != "cuda":
+        report_lines.append("peak_gpu_mem_note=CPU device; GPU memory not available")
     if best_sample is not None:
         report_lines.extend(
             [
@@ -373,6 +570,66 @@ def evaluate_single_model(
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
     logger.info(f"  Saved test report: {report_path}")
 
+    summary_json_path = run_root / f"{run_label}_extended_summary.json"
+    summary_payload = {
+        "model": model_name,
+        "scale": scale,
+        "quality_metrics": {
+            "psnr_mean": float(avg_psnr),
+            "ssim_mean": float(avg_ssim),
+            "l1_mean": float(avg_loss),
+            "mse_mean": ext_means["mse"],
+            "rmse_mean": ext_means["rmse"],
+            "gradient_mae_mean": ext_means["gradient_mae"],
+            "laplacian_mae_mean": ext_means["laplacian_mae"],
+            "fft_l1_mean": ext_means["fft_l1"],
+            "hfen_mean": ext_means["hfen"],
+        },
+        "profile": {
+            "params": profile_data.get("params"),
+            "params_m": profile_data.get("params_m"),
+            "model_size_mb": profile_data.get("model_size_mb"),
+            "macs": profile_data.get("macs"),
+            "gmacs": profile_data.get("gmacs"),
+            "flops": profile_data.get("flops"),
+            "gflops": profile_data.get("gflops"),
+            "latency_avg_ms": profile_data.get("latency_avg_ms"),
+            "latency_median_ms": profile_data.get("latency_median_ms"),
+            "latency_p95_ms": profile_data.get("latency_p95_ms"),
+            "fps": profile_data.get("fps"),
+            "peak_gpu_mem_mb": profile_data.get("peak_gpu_mem_mb"),
+        },
+    }
+    summary_json_path.write_text(json.dumps(summary_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"  Saved extended summary JSON: {summary_json_path}")
+
+    if args.profile_model:
+        logger.info(
+            "  Profile - "
+            + " | ".join(
+                [
+                    f"Params: {_na(profile_data.get('params'), 0)}",
+                    f"Params_M: {_na(profile_data.get('params_m'))}",
+                    f"ModelSizeMB: {_na(profile_data.get('model_size_mb'))}",
+                    f"GMACs: {_na(profile_data.get('gmacs'))}",
+                    f"GFLOPs: {_na(profile_data.get('gflops'))}",
+                ]
+            )
+        )
+    if args.benchmark_runtime:
+        logger.info(
+            "  Runtime - "
+            + " | ".join(
+                [
+                    f"LatencyAvg(ms): {_na(profile_data.get('latency_avg_ms'))}",
+                    f"LatencyMedian(ms): {_na(profile_data.get('latency_median_ms'))}",
+                    f"LatencyP95(ms): {_na(profile_data.get('latency_p95_ms'))}",
+                    f"FPS: {_na(profile_data.get('fps'))}",
+                    f"PeakGPUMem(MB): {_na(profile_data.get('peak_gpu_mem_mb'))}",
+                ]
+            )
+        )
+
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -383,6 +640,13 @@ def evaluate_single_model(
         "avg_loss": avg_loss,
         "avg_psnr": avg_psnr,
         "avg_ssim": avg_ssim,
+        "avg_mse": ext_means["mse"],
+        "avg_rmse": ext_means["rmse"],
+        "avg_gradient_mae": ext_means["gradient_mae"],
+        "avg_laplacian_mae": ext_means["laplacian_mae"],
+        "avg_fft_l1": ext_means["fft_l1"],
+        "avg_hfen": ext_means["hfen"],
+        "profile": profile_data,
         "report_path": report_path,
     }
 

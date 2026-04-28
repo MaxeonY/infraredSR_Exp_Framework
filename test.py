@@ -123,6 +123,19 @@ def parse_args():
     parser.add_argument("--rank_visuals_k", type=int, default=10, help="Top/Bottom-K samples for ranked visualization.")
     parser.add_argument("--no_rank_visuals", action="store_true", help="Disable best/worst sample visualizations.")
     parser.add_argument("--log_file", type=str, default="outputs/logs/test.log", help="Test log path.")
+    parser.add_argument("--extended_metrics", action="store_true", help="Enable extended quality metrics (MSE/RMSE/Gradient/Laplacian/FFT/HFEN).")
+    parser.add_argument("--profile_model", action="store_true", help="Profile model complexity metrics (Params/Size/MACs/FLOPs).")
+    parser.add_argument("--benchmark_runtime", action="store_true", help="Benchmark runtime metrics (latency/FPS/peak GPU memory).")
+    parser.add_argument(
+        "--profile_input_size",
+        type=int,
+        nargs=4,
+        default=[1, 1, 128, 128],
+        metavar=("N", "C", "H", "W"),
+        help="Input tensor size used for model profiling/benchmarking.",
+    )
+    parser.add_argument("--benchmark_warmup", type=int, default=20, help="Warmup iterations for runtime benchmark.")
+    parser.add_argument("--benchmark_repeat", type=int, default=100, help="Measured iterations for runtime benchmark.")
     return parser.parse_args()
 
 
@@ -131,6 +144,10 @@ def main():
     logger = setup_logger(name="test", log_file=args.log_file)
     if args.max_test_samples is not None and args.max_test_samples <= 0:
         raise ValueError("--max_test_samples must be > 0")
+    if args.benchmark_warmup < 0:
+        raise ValueError("--benchmark_warmup must be >= 0")
+    if args.benchmark_repeat <= 0:
+        raise ValueError("--benchmark_repeat must be > 0")
 
     dataset_cfg = load_yaml(args.dataset_cfg) if args.dataset_cfg and Path(args.dataset_cfg).exists() else {}
     args.degradation_cfg = dataset_cfg.get("degradation", dataset_cfg) if isinstance(dataset_cfg, dict) else {}

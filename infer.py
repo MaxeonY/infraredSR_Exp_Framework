@@ -16,6 +16,7 @@ def parse_args():
     parser.add_argument("--recursive", action="store_true", help="Recursively scan images when --input is a directory.")
     parser.add_argument("--save_bicubic", action="store_true", help="Also save bicubic-upsampled baseline image.")
     parser.add_argument("--gt", type=str, default=None, help="Optional ground-truth image path or directory.")
+    parser.add_argument("--extended_metrics", action="store_true", help="When --gt is provided, also compute MSE/RMSE/Gradient/Laplacian/FFT/HFEN.")
     parser.add_argument("--save_visuals", action="store_true", help="When --gt is provided, save LR/SR/HR comparison and SR-HR difference map.")
     parser.add_argument("--log_file", type=str, default="outputs/logs/infer.log", help="Log file path.")
     return parser.parse_args()
