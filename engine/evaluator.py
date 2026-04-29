@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from datasets.m3fd_dataset import M3FDSRDataset
+from datasets.sr_dataset import GenericSRDataset
 from models import SUPPORTED_MODELS, build_model, get_model_default_kwargs, merge_model_kwargs
 from utils.checkpoint import load_checkpoint, read_checkpoint
 from utils.metrics import calculate_extended_metrics, calculate_psnr, calculate_ssim
@@ -86,7 +86,7 @@ def _build_empty_profile() -> Dict[str, Optional[float]]:
 
 
 def resolve_sample_indices(
-    dataset: M3FDSRDataset,
+    dataset: GenericSRDataset,
     sample_index: Optional[int],
     sample_path: Optional[str],
     max_test_samples: Optional[int],
@@ -312,13 +312,14 @@ def evaluate_single_model(
     logger.info(f"Checkpoint  : {checkpoint_path}")
     logger.info(f"Test split  : {args.test_split}")
 
-    dataset = M3FDSRDataset(
+    dataset = GenericSRDataset(
         split_file=args.test_split,
         scale=scale,
         patch_size=args.patch_size,
         mode="test",
         augment=False,
         degradation_cfg=getattr(args, "degradation_cfg", None),
+        raw_root=getattr(args, "raw_data_root", None),
     )
     selected_indices = resolve_sample_indices(
         dataset=dataset,

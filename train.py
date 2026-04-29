@@ -1,11 +1,12 @@
 import argparse
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
-from datasets.builder import build_m3fd_dataset
+from datasets.builder import build_sr_dataset
+from datasets.registry import resolve_dataset_raw_root
 from engine.trainer import run_training
 from models import SUPPORTED_MODELS, build_model, merge_model_kwargs
 from utils.logger import setup_logger
@@ -36,7 +37,9 @@ def parse_args():
     parser.add_argument("--run_tag", type=str, default="", help="Optional run tag for profile filename.")
     parser.add_argument("--no_profile", action="store_true", help="Disable profile JSON/CSV export.")
 
-    parser.add_argument("--dataset_cfg", type=str, default="configs/dataset/m3fd.yaml", help="Dataset config YAML.")
+    parser.add_argument("--dataset_cfg", "--dataset-cfg", type=str, default="configs/dataset/default.yaml", help="Dataset config YAML.")
+    parser.add_argument("--dataset_name", "--dataset-name", type=str, default=None, help="Optional registered dataset name.")
+    parser.add_argument("--raw_data_root", "--raw-data-root", type=str, default=None, help="Optional raw dataset root for split path remapping.")
     parser.add_argument("--train_cfg", type=str, default="", help="Optional train config YAML.")
     parser.add_argument("--model_cfg", type=str, default="", help="Optional model config YAML.")
     args = parser.parse_args()
@@ -77,23 +80,41 @@ def _apply_train_cfg(args, train_cfg: Dict[str, object]) -> None:
             setattr(args, key, value)
 
 
+def resolve_raw_data_root(args, dataset_cfg: Dict[str, object]) -> Optional[str]:
+    if getattr(args, "raw_data_root", None):
+        return args.raw_data_root
+    if isinstance(dataset_cfg, dict) and dataset_cfg.get("raw_data_root"):
+        return str(dataset_cfg["raw_data_root"])
+
+    dataset_name = getattr(args, "dataset_name", None)
+    if not dataset_name and isinstance(dataset_cfg, dict):
+        dataset_name = dataset_cfg.get("dataset_name")
+    if dataset_name:
+        resolved = resolve_dataset_raw_root(str(dataset_name), Path.cwd())
+        return str(resolved) if resolved is not None else None
+    return None
+
+
 def build_dataloaders(args, dataset_cfg: Dict[str, object]) -> Tuple[DataLoader, DataLoader]:
     degradation_cfg = dataset_cfg.get("degradation", {}) if isinstance(dataset_cfg, dict) else {}
-    train_set = build_m3fd_dataset(
+    raw_data_root = resolve_raw_data_root(args, dataset_cfg)
+    train_set = build_sr_dataset(
         split_file=args.train_split,
         scale=args.scale,
         patch_size=args.patch_size,
         mode="train",
         augment=False,
         degradation_cfg=degradation_cfg,
+        raw_root=raw_data_root,
     )
-    val_set = build_m3fd_dataset(
+    val_set = build_sr_dataset(
         split_file=args.val_split,
         scale=args.scale,
         patch_size=args.patch_size,
         mode="val",
         augment=False,
         degradation_cfg=degradation_cfg,
+        raw_root=raw_data_root,
     )
 
     g = torch.Generator()
@@ -146,6 +167,9 @@ def main():
     logger = setup_logger(name="train", log_file=args.log_file)
     logger.info(f"Model         : {args.model}")
     logger.info(f"Scale         : x{args.scale}")
+    logger.info(f"Dataset cfg   : {args.dataset_cfg}")
+    logger.info(f"Dataset name  : {args.dataset_name or dataset_cfg.get('dataset_name', 'N/A') if isinstance(dataset_cfg, dict) else 'N/A'}")
+    logger.info(f"Raw data root : {resolve_raw_data_root(args, dataset_cfg) or 'N/A'}")
     logger.info(f"Train split   : {args.train_split}")
     logger.info(f"Val split     : {args.val_split}")
     logger.info(f"Patch size    : {args.patch_size}")

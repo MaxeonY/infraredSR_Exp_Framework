@@ -17,7 +17,6 @@ tensorboard/
 
 # Data and model weights
 data/
-datasets/
 *.pt
 *.pth
 *.ckpt

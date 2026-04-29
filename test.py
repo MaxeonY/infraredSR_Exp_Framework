@@ -3,10 +3,11 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from engine.evaluator import evaluate_models, infer_model_scale_from_checkpoint
 from models import SUPPORTED_MODELS
+from datasets.registry import resolve_dataset_raw_root
 from utils.logger import setup_logger
 from utils.misc import load_yaml
 
@@ -106,7 +107,9 @@ def parse_args():
     parser.add_argument("--all_models", action="store_true", help="Test ALL supported models.")
     parser.add_argument("--scales", type=int, nargs="+", default=None, help="Scale factors in multi-model mode.")
     parser.add_argument("--test_split", type=str, default="data/processed/test.txt", help="Test split file path.")
-    parser.add_argument("--dataset_cfg", type=str, default="configs/dataset/m3fd.yaml", help="Dataset config YAML.")
+    parser.add_argument("--dataset_cfg", "--dataset-cfg", type=str, default="configs/dataset/default.yaml", help="Dataset config YAML.")
+    parser.add_argument("--dataset_name", "--dataset-name", type=str, default=None, help="Optional registered dataset name.")
+    parser.add_argument("--raw_data_root", "--raw-data-root", type=str, default=None, help="Optional raw dataset root for split path remapping.")
     parser.add_argument("--patch_size", type=int, default=64, help="Unused in test mode, kept for interface consistency.")
     parser.add_argument("--batch_size", type=int, default=1, help="Test batch size.")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
@@ -139,6 +142,21 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_raw_data_root(args, dataset_cfg: Dict[str, object]) -> Optional[str]:
+    if getattr(args, "raw_data_root", None):
+        return args.raw_data_root
+    if isinstance(dataset_cfg, dict) and dataset_cfg.get("raw_data_root"):
+        return str(dataset_cfg["raw_data_root"])
+
+    dataset_name = getattr(args, "dataset_name", None)
+    if not dataset_name and isinstance(dataset_cfg, dict):
+        dataset_name = dataset_cfg.get("dataset_name")
+    if dataset_name:
+        resolved = resolve_dataset_raw_root(str(dataset_name), Path.cwd())
+        return str(resolved) if resolved is not None else None
+    return None
+
+
 def main():
     args = parse_args()
     logger = setup_logger(name="test", log_file=args.log_file)
@@ -151,6 +169,12 @@ def main():
 
     dataset_cfg = load_yaml(args.dataset_cfg) if args.dataset_cfg and Path(args.dataset_cfg).exists() else {}
     args.degradation_cfg = dataset_cfg.get("degradation", dataset_cfg) if isinstance(dataset_cfg, dict) else {}
+    args.raw_data_root = resolve_raw_data_root(args, dataset_cfg)
+    if args.dataset_name is None and isinstance(dataset_cfg, dict) and dataset_cfg.get("dataset_name"):
+        args.dataset_name = str(dataset_cfg["dataset_name"])
+    logger.info(f"Dataset cfg: {args.dataset_cfg}")
+    logger.info(f"Dataset name: {args.dataset_name or 'N/A'}")
+    logger.info(f"Raw data root: {args.raw_data_root or 'N/A'}")
 
     if args.checkpoint and (args.model is None or args.scale is None):
         inferred_model, inferred_scale = infer_model_scale_from_checkpoint(Path(args.checkpoint))
